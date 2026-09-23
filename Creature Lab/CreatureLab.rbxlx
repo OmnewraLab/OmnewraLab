@@ -1,0 +1,1118 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">Shared</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[--!strict
+-- Creature Lab · shared tuning values (read by server and client)
+-- Change numbers here to rebalance the game; no other file needs editing.
+
+local Config = {}
+
+-- Economy -------------------------------------------------------------
+Config.START_ENERGY = 30
+Config.HATCH_COST_BASE = 25          -- first hatch costs this much Energy
+Config.HATCH_COST_GROWTH = 1.12      -- each hatch costs 12% more than the last
+Config.HATCH_LUCKY_CHANCE = 0.08     -- free random bonus: 8% chance to hatch one tier higher (free, so no odds rule applies, but we still show it)
+
+Config.BASE_PADS = 6                 -- creatures that generate Energy at once
+Config.PADS_PASS_BONUS = 3           -- extra pads from the "Bigger Lab" game pass
+Config.MAX_TIER = 8
+
+-- Offline progress (reason to come back)
+Config.OFFLINE_CAP_SECONDS = 8 * 3600  -- earn for up to 8 hours away
+Config.OFFLINE_RATE = 0.5              -- at half speed
+
+-- Lab Surge: a server-wide 2x event every 15 minutes (a moment worth clipping)
+Config.SURGE_INTERVAL = 15 * 60
+Config.SURGE_DURATION = 60
+Config.SURGE_MULT = 2
+
+-- Visiting friends (co-play is a discovery signal)
+Config.BOOST_SECONDS = 60            -- a boost gives BOTH players 60s of their own income
+Config.BOOST_COOLDOWN = 20 * 60      -- per visitor, per lab
+
+-- Daily streak rewards (day 1..7, then loops)
+Config.DAILY_REWARDS = { 50, 120, 250, 400, 650, 1000, 2000 }
+
+-- Featured species of the week gets +25% output (weekly reason to return)
+Config.FEATURED_BONUS = 1.25
+
+-- Monetisation (fair, no paid random items) ------------------------------
+-- TODO: create these in the Creator Dashboard, then paste the real ids here.
+Config.GamePasses = {
+	DoubleEnergy = 0, -- 2x Energy forever
+	BiggerLab = 0,    -- +3 pads
+	VIPGlow = 0,      -- cosmetic rainbow glow on your lab sign
+}
+Config.Products = {
+	EnergyHour = 0,   -- instantly receive 1 hour of your current income
+}
+
+-- Creatures ------------------------------------------------------------
+export type Tier = { name: string, rate: number, color: Color3, size: number }
+
+Config.Tiers = {
+	{ name = "Spark",    rate = 1,    color = Color3.fromRGB(125, 211, 252), size = 1.4 },
+	{ name = "Glimmer",  rate = 3,    color = Color3.fromRGB(94, 234, 212),  size = 1.6 },
+	{ name = "Pulse",    rate = 8,    color = Color3.fromRGB(190, 242, 100), size = 1.8 },
+	{ name = "Flare",    rate = 20,   color = Color3.fromRGB(252, 211, 77),  size = 2.0 },
+	{ name = "Nova",     rate = 50,   color = Color3.fromRGB(253, 186, 116), size = 2.2 },
+	{ name = "Quasar",   rate = 125,  color = Color3.fromRGB(249, 168, 212), size = 2.4 },
+	{ name = "Nebula",   rate = 300,  color = Color3.fromRGB(196, 181, 253), size = 2.7 },
+	{ name = "Singular", rate = 750,  color = Color3.fromRGB(255, 255, 255), size = 3.0 },
+} :: { Tier }
+
+-- Species are cosmetic families; one is featured each week.
+Config.Species = { "Glowbug", "Mothling", "Voltfox", "Jellyfloat", "Embercat", "Frostling", "Moonowl", "Sproutle" }
+
+function Config.hatchCost(hatches: number): number
+	return math.floor(Config.HATCH_COST_BASE * Config.HATCH_COST_GROWTH ^ hatches)
+end
+
+-- Week number since Unix epoch, used to rotate the featured species for everyone at once.
+function Config.featuredSpecies(now: number): string
+	local week = math.floor(now / (7 * 24 * 3600))
+	return Config.Species[(week % #Config.Species) + 1]
+end
+
+-- Short numbers for UI: 1500 -> 1.5K
+function Config.short(n: number): string
+	local units = { "", "K", "M", "B", "T", "Qa" }
+	local i = 1
+	while math.abs(n) >= 1000 and i < #units do
+		n /= 1000
+		i += 1
+	end
+	if i == 1 then
+		return tostring(math.floor(n))
+	end
+	return string.format("%.1f%s", n, units[i])
+end
+
+return Config
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="3">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Folder" referent="4">
+      <Properties>
+        <string name="Name">Server</string>
+      </Properties>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">DataService</string>
+          <string name="Source"><![CDATA[--!strict
+-- Creature Lab · player data: load, cache, autosave. DataStore calls are wrapped in pcall.
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+
+local Config = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Config"))
+
+local STORE_NAME = "CreatureLab_v1"
+local store = DataStoreService:GetDataStore(STORE_NAME)
+
+export type Creature = { id: number, tier: number, species: string }
+export type Data = {
+	energy: number,
+	totalEarned: number,
+	hatches: number,
+	creatures: { Creature },
+	nextId: number,
+	lastSeen: number,
+	dailyDay: number,   -- day index of last claim
+	dailyStreak: number,
+	receipts: { string }, -- recent processed purchase ids (idempotency)
+	tutorialDone: boolean,
+}
+
+local DataService = {}
+local cache: { [Player]: Data } = {}
+local loadedOk: { [Player]: boolean } = {}
+
+local function default(): Data
+	return {
+		energy = Config.START_ENERGY,
+		totalEarned = 0,
+		hatches = 0,
+		creatures = { { id = 1, tier = 1, species = Config.Species[1] } }, -- start with one producing creature
+		nextId = 2,
+		lastSeen = os.time(),
+		dailyDay = 0,
+		dailyStreak = 0,
+		receipts = {},
+		tutorialDone = false,
+	}
+end
+
+-- Fill in any fields added in later versions so old saves keep working.
+local function reconcile(saved: any): Data
+	local d = default()
+	if type(saved) ~= "table" then
+		return d
+	end
+	for k, v in pairs(saved) do
+		(d :: any)[k] = v
+	end
+	return d
+end
+
+function DataService.load(player: Player): Data
+	local key = "u_" .. player.UserId
+	local data: Data? = nil
+	for attempt = 1, 3 do
+		local ok, result = pcall(function()
+			return store:GetAsync(key)
+		end)
+		if ok then
+			data = reconcile(result)
+			loadedOk[player] = true
+			break
+		end
+		warn(("[Data] load attempt %d failed for %s: %s"):format(attempt, player.Name, tostring(result)))
+		task.wait(attempt)
+	end
+	if not data then
+		-- Never overwrite a real save with defaults: play on, but don't save this session.
+		data = default()
+		loadedOk[player] = false
+	end
+	cache[player] = data :: Data
+	return data :: Data
+end
+
+function DataService.get(player: Player): Data?
+	return cache[player]
+end
+
+function DataService.save(player: Player)
+	local data = cache[player]
+	if not data or not loadedOk[player] then
+		return
+	end
+	-- In Studio, saving needs Game Settings > Security > "Enable Studio Access to API Services".
+	if RunService:IsStudio() and not game:GetService("ServerStorage"):GetAttribute("AllowStudioSaves") then
+		return
+	end
+	data.lastSeen = os.time()
+	local key = "u_" .. player.UserId
+	local ok, err = pcall(function()
+		store:UpdateAsync(key, function()
+			return data
+		end)
+	end)
+	if not ok then
+		warn(("[Data] save failed for %s: %s"):format(player.Name, tostring(err)))
+	end
+end
+
+function DataService.release(player: Player)
+	DataService.save(player)
+	cache[player] = nil
+	loadedOk[player] = nil
+end
+
+function DataService.all(): { [Player]: Data }
+	return cache
+end
+
+return DataService
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">LabWorld</string>
+          <string name="Source"><![CDATA[--!strict
+-- Creature Lab · builds the world in code (no manual map work needed for the prototype):
+-- a ring of lab plots around the spawn, each with glowing pads that show the owner's creatures.
+local TweenService = game:GetService("TweenService")
+
+local Config = require(game:GetService("ReplicatedStorage"):WaitForChild("Shared"):WaitForChild("Config"))
+
+local LabWorld = {}
+
+local PLOT_COUNT = 8
+local RING_RADIUS = 70
+local PAD_SPACING = 7
+
+type Plot = { model: Model, base: BasePart, sign: TextLabel, pads: { BasePart }, owner: Player? }
+local plots: { Plot } = {}
+
+local function part(props: { [string]: any }): Part
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	for k, v in pairs(props) do
+		(p :: any)[k] = v
+	end
+	return p
+end
+
+function LabWorld.build()
+	local folder = Instance.new("Folder")
+	folder.Name = "Labs"
+	folder.Parent = workspace
+
+	-- central hub + spawn
+	part({ Name = "Hub", Size = Vector3.new(40, 1, 40), Position = Vector3.new(0, 0, 0), Color = Color3.fromRGB(28, 33, 39), Material = Enum.Material.SmoothPlastic, Parent = folder })
+	local core = part({ Name = "Core", Shape = Enum.PartType.Ball, Size = Vector3.new(8, 8, 8), Position = Vector3.new(0, 10, 0), Color = Color3.fromRGB(94, 234, 212), Material = Enum.Material.Neon, CanCollide = false, Parent = folder })
+	local light = Instance.new("PointLight")
+	light.Range = 40
+	light.Brightness = 3
+	light.Color = core.Color
+	light.Parent = core
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Anchored = true
+	spawn.Size = Vector3.new(8, 1, 8)
+	spawn.Position = Vector3.new(0, 1, 12)
+	spawn.Transparency = 1
+	spawn.CanCollide = false
+	spawn.Parent = folder
+
+	for i = 1, PLOT_COUNT do
+		local angle = (i - 1) / PLOT_COUNT * math.pi * 2
+		local center = Vector3.new(math.cos(angle) * RING_RADIUS, 0, math.sin(angle) * RING_RADIUS)
+		local model = Instance.new("Model")
+		model.Name = "Lab" .. i
+		model.Parent = folder
+
+		local base = part({ Name = "Base", Size = Vector3.new(30, 1, 30), Color = Color3.fromRGB(22, 26, 31), Material = Enum.Material.SmoothPlastic, Parent = model })
+		base.CFrame = CFrame.lookAt(center, Vector3.zero) -- face the hub
+		-- walkway to the hub
+		local mid = center * 0.62
+		local path = part({ Name = "Path", Size = Vector3.new(6, 0.6, RING_RADIUS - 35), Color = Color3.fromRGB(40, 46, 54), Material = Enum.Material.SmoothPlastic, Parent = model })
+		path.CFrame = CFrame.lookAt(mid, Vector3.zero)
+
+		-- owner sign
+		local post = part({ Name = "Sign", Size = Vector3.new(10, 5, 0.6), Color = Color3.fromRGB(17, 20, 24), Parent = model })
+		post.CFrame = base.CFrame * CFrame.new(0, 3.5, -13)
+		local gui = Instance.new("SurfaceGui")
+		gui.Face = Enum.NormalId.Front
+		gui.PixelsPerStud = 40
+		gui.Parent = post
+		local label = Instance.new("TextLabel")
+		label.Size = UDim2.fromScale(1, 1)
+		label.BackgroundTransparency = 1
+		label.TextScaled = true
+		label.Font = Enum.Font.GothamBold
+		label.TextColor3 = Color3.fromRGB(236, 238, 241)
+		label.Text = "Empty lab"
+		label.Parent = gui
+
+		-- creature pads in a 3 x 3 grid (up to 9 with the Bigger Lab pass)
+		local pads = {}
+		for r = 0, 2 do
+			for c = 0, 2 do
+				local pad = part({ Name = "Pad", Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.4, 4, 4), Color = Color3.fromRGB(40, 46, 54), Material = Enum.Material.Metal, Parent = model })
+				pad.CFrame = base.CFrame * CFrame.new((c - 1) * PAD_SPACING, 0.7, (r - 1) * PAD_SPACING + 2) * CFrame.Angles(0, 0, math.rad(90))
+				table.insert(pads, pad)
+			end
+		end
+
+		-- boost prompt (visitors help each other)
+		local prompt = Instance.new("ProximityPrompt")
+		prompt.ActionText = "Boost this lab"
+		prompt.ObjectText = "Visitor boost"
+		prompt.HoldDuration = 0.6
+		prompt.MaxActivationDistance = 14
+		prompt.Parent = post
+
+		table.insert(plots, { model = model, base = base, sign = label, pads = pads, owner = nil })
+	end
+end
+
+function LabWorld.claim(player: Player): number?
+	for i, p in ipairs(plots) do
+		if p.owner == nil then
+			p.owner = player
+			p.sign.Text = player.DisplayName .. "'s Lab"
+			return i
+		end
+	end
+	return nil
+end
+
+function LabWorld.release(player: Player)
+	for _, p in ipairs(plots) do
+		if p.owner == player then
+			p.owner = nil
+			p.sign.Text = "Empty lab"
+			for _, pad in ipairs(p.pads) do
+				local old = pad:FindFirstChild("Creature")
+				if old then
+					old:Destroy()
+				end
+			end
+		end
+	end
+end
+
+function LabWorld.plotOf(player: Player): Plot?
+	for _, p in ipairs(plots) do
+		if p.owner == player then
+			return p
+		end
+	end
+	return nil
+end
+
+function LabWorld.ownerOfPrompt(prompt: ProximityPrompt): Player?
+	for _, p in ipairs(plots) do
+		if prompt:IsDescendantOf(p.model) then
+			return p.owner
+		end
+	end
+	return nil
+end
+
+function LabWorld.prompts(): { ProximityPrompt }
+	local list = {}
+	for _, p in ipairs(plots) do
+		local pr = p.model:FindFirstChildWhichIsA("ProximityPrompt", true)
+		if pr then
+			table.insert(list, pr :: ProximityPrompt)
+		end
+	end
+	return list
+end
+
+-- Show the active creatures as glowing, bobbing orbs above the pads.
+function LabWorld.render(player: Player, active: { { tier: number, species: string } }, vipGlow: boolean)
+	local p = LabWorld.plotOf(player)
+	if not p then
+		return
+	end
+	for i, pad in ipairs(p.pads) do
+		local old = pad:FindFirstChild("Creature")
+		if old then
+			old:Destroy()
+		end
+		local c = active[i]
+		if c then
+			local tier = Config.Tiers[c.tier]
+			local orb = part({ Name = "Creature", Shape = Enum.PartType.Ball, Size = Vector3.one * tier.size, Color = tier.color, Material = Enum.Material.Neon, CanCollide = false })
+			orb.CFrame = CFrame.new(pad.Position + Vector3.new(0, 2.2 + tier.size / 2, 0))
+			orb.Parent = pad
+			local glow = Instance.new("PointLight")
+			glow.Color = tier.color
+			glow.Range = 6 + c.tier
+			glow.Parent = orb
+			local tag = Instance.new("BillboardGui")
+			tag.Size = UDim2.fromOffset(120, 30)
+			tag.StudsOffset = Vector3.new(0, tier.size / 2 + 1, 0)
+			tag.AlwaysOnTop = false
+			tag.MaxDistance = 40
+			tag.Parent = orb
+			local t = Instance.new("TextLabel")
+			t.Size = UDim2.fromScale(1, 1)
+			t.BackgroundTransparency = 1
+			t.Font = Enum.Font.GothamMedium
+			t.TextScaled = true
+			t.TextColor3 = tier.color
+			t.Text = tier.name .. " " .. c.species
+			t.Parent = tag
+			-- gentle bob so the lab feels alive
+			TweenService:Create(orb, TweenInfo.new(1.6 + (i % 3) * 0.3, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { CFrame = orb.CFrame + Vector3.new(0, 0.8, 0) }):Play()
+		end
+	end
+	p.sign.TextColor3 = vipGlow and Color3.fromHSV((os.clock() * 0.1) % 1, 0.5, 1) or Color3.fromRGB(236, 238, 241)
+end
+
+function LabWorld.teleportHome(player: Player)
+	local p = LabWorld.plotOf(player)
+	local char = player.Character
+	if p and char and char:FindFirstChild("HumanoidRootPart") then
+		(char :: Model):PivotTo(p.base.CFrame * CFrame.new(0, 4, 10))
+	end
+end
+
+return LabWorld
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Script" referent="7">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[--!strict
+-- Creature Lab · main game loop (server-authoritative)
+-- Loop: creatures on pads make Energy -> spend Energy to hatch more -> fuse pairs into higher tiers -> repeat.
+-- Return hooks: offline income, daily streak, weekly featured species, Lab Surge every 15 min, boosting friends.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local DataService = require(script.Parent:WaitForChild("DataService"))
+local LabWorld = require(script.Parent:WaitForChild("LabWorld"))
+
+-- Remotes -------------------------------------------------------------
+local remotes = Instance.new("Folder")
+remotes.Name = "Remotes"
+remotes.Parent = ReplicatedStorage
+local function remote(className: string, name: string): Instance
+	local r = Instance.new(className)
+	r.Name = name
+	r.Parent = remotes
+	return r
+end
+local StateEvent = remote("RemoteEvent", "State") :: RemoteEvent       -- server -> client snapshot
+local NotifyEvent = remote("RemoteEvent", "Notify") :: RemoteEvent     -- server -> client toast
+local ActionFn = remote("RemoteFunction", "Action") :: RemoteFunction  -- client -> server requests
+
+LabWorld.build()
+
+-- Session state --------------------------------------------------------
+local owns: { [Player]: { DoubleEnergy: boolean, BiggerLab: boolean, VIPGlow: boolean } } = {}
+local lastAction: { [Player]: number } = {}
+local boostCooldown: { [string]: number } = {} -- "visitorId:ownerId" -> os.time when allowed again
+local surgeEndsAt = 0
+local nextSurgeAt = os.time() + Config.SURGE_INTERVAL
+
+local function ownsPass(player: Player, id: number): boolean
+	if id == 0 then
+		return false
+	end
+	local ok, result = pcall(function()
+		return MarketplaceService:UserOwnsGamePassAsync(player.UserId, id)
+	end)
+	return ok and result == true
+end
+
+local function padCount(player: Player): number
+	local o = owns[player]
+	return Config.BASE_PADS + ((o and o.BiggerLab) and Config.PADS_PASS_BONUS or 0)
+end
+
+-- Highest-tier creatures fill the pads first.
+local function activeCreatures(player: Player, data: DataService.Data): { DataService.Creature }
+	local sorted = table.clone(data.creatures)
+	table.sort(sorted, function(a, b)
+		return a.tier > b.tier
+	end)
+	local active = {}
+	for i = 1, math.min(padCount(player), #sorted) do
+		active[i] = sorted[i]
+	end
+	return active
+end
+
+local function ratePerSecond(player: Player, data: DataService.Data): number
+	local featured = Config.featuredSpecies(os.time())
+	local rate = 0
+	for _, c in ipairs(activeCreatures(player, data)) do
+		local r = Config.Tiers[c.tier].rate
+		if c.species == featured then
+			r *= Config.FEATURED_BONUS
+		end
+		rate += r
+	end
+	local o = owns[player]
+	if o and o.DoubleEnergy then
+		rate *= 2
+	end
+	if os.time() < surgeEndsAt then
+		rate *= Config.SURGE_MULT
+	end
+	return rate
+end
+
+local function dayIndex(t: number): number
+	return math.floor(t / 86400)
+end
+
+local function snapshot(player: Player)
+	local data = DataService.get(player)
+	if not data then
+		return
+	end
+	local counts = {}
+	for t = 1, Config.MAX_TIER do
+		counts[t] = 0
+	end
+	for _, c in ipairs(data.creatures) do
+		counts[c.tier] += 1
+	end
+	local today = dayIndex(os.time())
+	StateEvent:FireClient(player, {
+		energy = data.energy,
+		rate = ratePerSecond(player, data),
+		hatchCost = Config.hatchCost(data.hatches),
+		counts = counts,
+		total = #data.creatures,
+		pads = padCount(player),
+		featured = Config.featuredSpecies(os.time()),
+		surgeEndsAt = surgeEndsAt,
+		nextSurgeAt = nextSurgeAt,
+		dailyReady = data.dailyDay < today,
+		dailyStreak = data.dailyStreak,
+		tutorialDone = data.tutorialDone,
+		serverTime = os.time(),
+	})
+end
+
+local function rerender(player: Player)
+	local data = DataService.get(player)
+	if not data then
+		return
+	end
+	local o = owns[player]
+	LabWorld.render(player, activeCreatures(player, data), (o ~= nil) and o.VIPGlow)
+	snapshot(player)
+end
+
+local function leaderstats(player: Player)
+	local ls = Instance.new("Folder")
+	ls.Name = "leaderstats"
+	local power = Instance.new("NumberValue")
+	power.Name = "Lab Power"
+	power.Parent = ls
+	local best = Instance.new("StringValue")
+	best.Name = "Best"
+	best.Value = "Spark"
+	best.Parent = ls
+	ls.Parent = player
+end
+
+local function updateLeaderstats(player: Player, data: DataService.Data)
+	local ls = player:FindFirstChild("leaderstats")
+	if not ls then
+		return
+	end
+	(ls:FindFirstChild("Lab Power") :: NumberValue).Value = math.floor(ratePerSecond(player, data))
+	local top = 1
+	for _, c in ipairs(data.creatures) do
+		top = math.max(top, c.tier)
+	end
+	(ls:FindFirstChild("Best") :: StringValue).Value = Config.Tiers[top].name
+end
+
+-- Actions ----------------------------------------------------------------
+local function hatch(player: Player, data: DataService.Data): (boolean, string)
+	local cost = Config.hatchCost(data.hatches)
+	if data.energy < cost then
+		return false, ("Need %s Energy"):format(Config.short(cost - data.energy))
+	end
+	data.energy -= cost
+	data.hatches += 1
+	local tier = 1
+	if math.random() < Config.HATCH_LUCKY_CHANCE then
+		tier = 2
+	end
+	local species = Config.Species[math.random(1, #Config.Species)]
+	table.insert(data.creatures, { id = data.nextId, tier = tier, species = species })
+	data.nextId += 1
+	data.tutorialDone = data.tutorialDone or data.hatches >= 3
+	return true, (tier > 1 and "Lucky! " or "Hatched ") .. Config.Tiers[tier].name .. " " .. species
+end
+
+-- Fuse every matching pair, lowest tiers first, so one tap feels big.
+local function fuseAll(data: DataService.Data): (boolean, string)
+	local fused = 0
+	local bestTier = 0
+	for tier = 1, Config.MAX_TIER - 1 do
+		local pool = {}
+		for i, c in ipairs(data.creatures) do
+			if c.tier == tier then
+				table.insert(pool, i)
+			end
+		end
+		local pairsCount = math.floor(#pool / 2)
+		if pairsCount > 0 then
+			local remove = {}
+			for p = 1, pairsCount do
+				local keep = data.creatures[pool[p * 2 - 1]]
+				keep.tier = tier + 1
+				remove[pool[p * 2]] = true
+				fused += 1
+				bestTier = math.max(bestTier, tier + 1)
+			end
+			local kept = {}
+			for i, c in ipairs(data.creatures) do
+				if not remove[i] then
+					table.insert(kept, c)
+				end
+			end
+			data.creatures = kept
+		end
+	end
+	if fused == 0 then
+		return false, "Need two creatures of the same tier to fuse"
+	end
+	return true, ("Fused %d! Best: %s"):format(fused, Config.Tiers[bestTier].name)
+end
+
+local function claimDaily(data: DataService.Data): (boolean, string)
+	local today = dayIndex(os.time())
+	if data.dailyDay >= today then
+		return false, "Come back tomorrow for your next reward"
+	end
+	if data.dailyDay == today - 1 then
+		data.dailyStreak += 1
+	else
+		data.dailyStreak = 1
+	end
+	data.dailyDay = today
+	local reward = Config.DAILY_REWARDS[((data.dailyStreak - 1) % #Config.DAILY_REWARDS) + 1]
+	data.energy += reward
+	return true, ("Day %d streak: +%s Energy"):format(data.dailyStreak, Config.short(reward))
+end
+
+ActionFn.OnServerInvoke = function(player: Player, action: any)
+	local now = os.clock()
+	if lastAction[player] and now - lastAction[player] < 0.25 then
+		return false, "Slow down"
+	end
+	lastAction[player] = now
+	local data = DataService.get(player)
+	if not data or type(action) ~= "string" then
+		return false, "Not ready"
+	end
+	local ok, msg
+	if action == "hatch" then
+		ok, msg = hatch(player, data)
+	elseif action == "fuse" then
+		ok, msg = fuseAll(data)
+	elseif action == "daily" then
+		ok, msg = claimDaily(data)
+	elseif action == "home" then
+		LabWorld.teleportHome(player)
+		return true, ""
+	else
+		return false, "Unknown action"
+	end
+	if ok then
+		rerender(player)
+		updateLeaderstats(player, data)
+	end
+	return ok, msg
+end
+
+-- Visitors boost each other's labs (both get income)
+for _, prompt in ipairs(LabWorld.prompts()) do
+	prompt.Triggered:Connect(function(visitor: Player)
+		local owner = LabWorld.ownerOfPrompt(prompt)
+		if not owner or owner == visitor then
+			NotifyEvent:FireClient(visitor, "Visit a friend's lab to boost it")
+			return
+		end
+		local key = visitor.UserId .. ":" .. owner.UserId
+		if (boostCooldown[key] or 0) > os.time() then
+			NotifyEvent:FireClient(visitor, "You boosted this lab recently")
+			return
+		end
+		boostCooldown[key] = os.time() + Config.BOOST_COOLDOWN
+		for _, p in ipairs({ visitor, owner }) do
+			local d = DataService.get(p)
+			if d then
+				local gain = ratePerSecond(p, d) * Config.BOOST_SECONDS
+				d.energy += gain
+				d.totalEarned += gain
+				NotifyEvent:FireClient(p, ("Lab boost! +%s Energy"):format(Config.short(gain)))
+				snapshot(p)
+			end
+		end
+	end)
+end
+
+-- Purchases --------------------------------------------------------------
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, passId: number, purchased: boolean)
+	if not purchased or not owns[player] then
+		return
+	end
+	for name, id in pairs(Config.GamePasses) do
+		if id == passId then
+			(owns[player] :: any)[name] = true
+		end
+	end
+	rerender(player)
+end)
+
+MarketplaceService.ProcessReceipt = function(receipt: any)
+	local player = Players:GetPlayerByUserId(receipt.PlayerId)
+	local data = player and DataService.get(player)
+	if not player or not data then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+	if table.find(data.receipts, receipt.PurchaseId) then
+		return Enum.ProductPurchaseDecision.PurchaseGranted
+	end
+	if receipt.ProductId == Config.Products.EnergyHour then
+		local gain = ratePerSecond(player, data) * 3600
+		data.energy += gain
+		data.totalEarned += gain
+		NotifyEvent:FireClient(player, ("+%s Energy"):format(Config.short(gain)))
+	end
+	table.insert(data.receipts, receipt.PurchaseId)
+	if #data.receipts > 50 then
+		table.remove(data.receipts, 1)
+	end
+	DataService.save(player)
+	return Enum.ProductPurchaseDecision.PurchaseGranted
+end
+
+-- Players ------------------------------------------------------------------
+local function onJoin(player: Player)
+	local data = DataService.load(player)
+	owns[player] = {
+		DoubleEnergy = ownsPass(player, Config.GamePasses.DoubleEnergy),
+		BiggerLab = ownsPass(player, Config.GamePasses.BiggerLab),
+		VIPGlow = ownsPass(player, Config.GamePasses.VIPGlow),
+	}
+	leaderstats(player)
+	if not LabWorld.claim(player) then
+		NotifyEvent:FireClient(player, "This server's labs are full")
+	end
+
+	-- offline income: a reason to come back
+	local away = math.clamp(os.time() - data.lastSeen, 0, Config.OFFLINE_CAP_SECONDS)
+	if away > 60 then
+		local gain = ratePerSecond(player, data) * away * Config.OFFLINE_RATE
+		if gain >= 1 then
+			data.energy += gain
+			data.totalEarned += gain
+			task.delay(3, function()
+				NotifyEvent:FireClient(player, ("While you were away your lab made %s Energy"):format(Config.short(gain)))
+			end)
+		end
+	end
+
+	player.CharacterAdded:Connect(function()
+		task.wait(0.5)
+		LabWorld.teleportHome(player)
+	end)
+	if player.Character then
+		LabWorld.teleportHome(player)
+	end
+	rerender(player)
+	updateLeaderstats(player, data)
+end
+
+Players.PlayerAdded:Connect(onJoin)
+for _, p in ipairs(Players:GetPlayers()) do
+	task.spawn(onJoin, p)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	DataService.release(player)
+	LabWorld.release(player)
+	owns[player] = nil
+	lastAction[player] = nil
+end)
+
+game:BindToClose(function()
+	for player in pairs(DataService.all()) do
+		DataService.save(player)
+	end
+end)
+
+-- Income tick (1 s), surge scheduler and autosave --------------------------
+task.spawn(function()
+	local saveTimer = 0
+	while true do
+		task.wait(1)
+		local now = os.time()
+		if now >= nextSurgeAt then
+			surgeEndsAt = now + Config.SURGE_DURATION
+			nextSurgeAt = now + Config.SURGE_INTERVAL
+			for _, p in ipairs(Players:GetPlayers()) do
+				NotifyEvent:FireClient(p, "LAB SURGE! 2x Energy for 60 seconds")
+			end
+		end
+		for player, data in pairs(DataService.all()) do
+			local gain = ratePerSecond(player, data)
+			data.energy += gain
+			data.totalEarned += gain
+			snapshot(player)
+		end
+		saveTimer += 1
+		if saveTimer >= 60 then
+			saveTimer = 0
+			for player in pairs(DataService.all()) do
+				task.spawn(DataService.save, player)
+			end
+		end
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="8">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="9">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="10">
+        <Properties>
+          <string name="Name">Client</string>
+        </Properties>
+        <Item class="LocalScript" referent="11">
+          <Properties>
+            <string name="Name">LabUI</string>
+            <string name="Source"><![CDATA[--!strict
+-- Creature Lab · player UI, built in code so the prototype needs no manual GUI work.
+-- Mobile-first: big buttons bottom-centre, readable counter top-centre.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local Config = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Config"))
+local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local StateEvent = remotes:WaitForChild("State") :: RemoteEvent
+local NotifyEvent = remotes:WaitForChild("Notify") :: RemoteEvent
+local ActionFn = remotes:WaitForChild("Action") :: RemoteFunction
+
+local player = Players.LocalPlayer
+local gui = Instance.new("ScreenGui")
+gui.Name = "LabUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local INK = Color3.fromRGB(236, 238, 241)
+local PANEL = Color3.fromRGB(17, 20, 24)
+local ACCENT = Color3.fromRGB(94, 234, 212)
+
+local function round(inst: GuiObject, r: number)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r)
+	c.Parent = inst
+end
+
+local function label(parent: Instance, text: string, size: number, color: Color3?): TextLabel
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Font = Enum.Font.GothamBold
+	l.TextSize = size
+	l.TextColor3 = color or INK
+	l.Text = text
+	l.Parent = parent
+	return l
+end
+
+-- Top: energy counter ------------------------------------------------------
+local top = Instance.new("Frame")
+top.AnchorPoint = Vector2.new(0.5, 0)
+top.Position = UDim2.new(0.5, 0, 0, 10)
+top.Size = UDim2.fromOffset(280, 64)
+top.BackgroundColor3 = PANEL
+top.BackgroundTransparency = 0.15
+top.Parent = gui
+round(top, 16)
+local energyLabel = label(top, "0", 30, ACCENT)
+energyLabel.Size = UDim2.new(1, 0, 0, 38)
+energyLabel.Position = UDim2.fromOffset(0, 4)
+local rateLabel = label(top, "+0/s", 14)
+rateLabel.Font = Enum.Font.GothamMedium
+rateLabel.Size = UDim2.new(1, 0, 0, 18)
+rateLabel.Position = UDim2.fromOffset(0, 40)
+
+local infoLabel = label(gui, "", 14, Color3.fromRGB(138, 146, 157))
+infoLabel.Font = Enum.Font.GothamMedium
+infoLabel.AnchorPoint = Vector2.new(0.5, 0)
+infoLabel.Position = UDim2.new(0.5, 0, 0, 80)
+infoLabel.Size = UDim2.fromOffset(420, 20)
+
+-- Surge banner
+local surge = label(gui, "", 22, Color3.fromRGB(252, 211, 77))
+surge.AnchorPoint = Vector2.new(0.5, 0)
+surge.Position = UDim2.new(0.5, 0, 0, 104)
+surge.Size = UDim2.fromOffset(420, 30)
+surge.Visible = false
+
+-- Bottom: action buttons ---------------------------------------------------
+local bar = Instance.new("Frame")
+bar.AnchorPoint = Vector2.new(0.5, 1)
+bar.Position = UDim2.new(0.5, 0, 1, -16)
+bar.Size = UDim2.fromOffset(460, 70)
+bar.BackgroundTransparency = 1
+bar.Parent = gui
+local layout = Instance.new("UIListLayout")
+layout.FillDirection = Enum.FillDirection.Horizontal
+layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+layout.Padding = UDim.new(0, 10)
+layout.Parent = bar
+
+local function button(text: string, color: Color3, width: number): TextButton
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(width, 64)
+	b.BackgroundColor3 = color
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 18
+	b.TextColor3 = Color3.fromRGB(10, 12, 15)
+	b.Text = text
+	b.AutoButtonColor = true
+	b.Parent = bar
+	round(b, 14)
+	return b
+end
+local hatchBtn = button("Hatch", ACCENT, 170)
+local fuseBtn = button("Fuse all", Color3.fromRGB(196, 181, 253), 130)
+local dailyBtn = button("Daily", Color3.fromRGB(252, 211, 77), 130)
+
+-- Left: collection counts --------------------------------------------------
+local coll = Instance.new("Frame")
+coll.Position = UDim2.fromOffset(12, 140)
+coll.Size = UDim2.fromOffset(170, 250)
+coll.BackgroundColor3 = PANEL
+coll.BackgroundTransparency = 0.2
+coll.Parent = gui
+round(coll, 12)
+local collList = Instance.new("UIListLayout")
+collList.Padding = UDim.new(0, 2)
+collList.Parent = coll
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 8)
+pad.PaddingLeft = UDim.new(0, 10)
+pad.Parent = coll
+local tierRows: { TextLabel } = {}
+for t, tier in ipairs(Config.Tiers) do
+	local row = label(coll, "", 14, tier.color)
+	row.Font = Enum.Font.GothamMedium
+	row.TextXAlignment = Enum.TextXAlignment.Left
+	row.Size = UDim2.new(1, -10, 0, 26)
+	row.LayoutOrder = t
+	tierRows[t] = row
+end
+
+-- Home button (top-left)
+local homeBtn = Instance.new("TextButton")
+homeBtn.Position = UDim2.fromOffset(12, 96)
+homeBtn.Size = UDim2.fromOffset(110, 36)
+homeBtn.BackgroundColor3 = PANEL
+homeBtn.TextColor3 = INK
+homeBtn.Font = Enum.Font.GothamMedium
+homeBtn.TextSize = 14
+homeBtn.Text = "My lab"
+homeBtn.Parent = gui
+round(homeBtn, 10)
+
+-- Toasts --------------------------------------------------------------------
+local toast = label(gui, "", 18)
+toast.AnchorPoint = Vector2.new(0.5, 1)
+toast.Position = UDim2.new(0.5, 0, 1, -96)
+toast.Size = UDim2.fromOffset(460, 40)
+toast.BackgroundColor3 = PANEL
+toast.BackgroundTransparency = 0.1
+toast.Visible = false
+round(toast, 12)
+local toastToken = 0
+local function showToast(text: string)
+	if text == "" then
+		return
+	end
+	toastToken += 1
+	local my = toastToken
+	toast.Text = text
+	toast.Visible = true
+	toast.TextTransparency = 0
+	task.delay(2.6, function()
+		if my == toastToken then
+			toast.Visible = false
+		end
+	end)
+end
+
+-- Tutorial hint for the first minute (the first 60 s decide whether players stay)
+local hint = label(gui, "Tap HATCH to get your next creature, then FUSE two of the same kind!", 16, Color3.fromRGB(252, 211, 77))
+hint.AnchorPoint = Vector2.new(0.5, 1)
+hint.Position = UDim2.new(0.5, 0, 1, -140)
+hint.Size = UDim2.fromOffset(560, 24)
+TweenService:Create(hint, TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), { TextTransparency = 0.5 }):Play()
+
+-- State ---------------------------------------------------------------------
+local state: any = nil
+local shownEnergy = 0
+
+StateEvent.OnClientEvent:Connect(function(s)
+	state = s
+	hatchBtn.Text = ("Hatch  %s"):format(Config.short(s.hatchCost))
+	hatchBtn.BackgroundTransparency = s.energy >= s.hatchCost and 0 or 0.45
+	rateLabel.Text = ("+%s Energy/s  ·  %d/%d pads"):format(Config.short(s.rate), math.min(s.total, s.pads), s.pads)
+	infoLabel.Text = ("Featured this week: %s (+25%%)"):format(s.featured)
+	dailyBtn.Text = s.dailyReady and "Daily!" or ("Streak " .. s.dailyStreak)
+	dailyBtn.BackgroundTransparency = s.dailyReady and 0 or 0.45
+	for t, row in ipairs(tierRows) do
+		local n = s.counts[t] or 0
+		row.Text = ("%s  ×%d"):format(Config.Tiers[t].name, n)
+		row.TextTransparency = n > 0 and 0 or 0.6
+	end
+	hint.Visible = not s.tutorialDone
+end)
+
+-- Smooth counter + surge countdown
+task.spawn(function()
+	while true do
+		task.wait(0.05)
+		if state then
+			shownEnergy += (state.energy - shownEnergy) * 0.25
+			energyLabel.Text = Config.short(shownEnergy) .. " Energy"
+			-- os.time() is UTC on both client and server, so the countdown lines up
+			if os.time() < state.surgeEndsAt then
+				surge.Visible = true
+				surge.Text = ("LAB SURGE  2x  ·  %ds"):format(state.surgeEndsAt - os.time())
+			else
+				surge.Visible = false
+			end
+		end
+	end
+end)
+
+NotifyEvent.OnClientEvent:Connect(function(text: string)
+	showToast(text)
+end)
+
+local function act(name: string)
+	local ok, msg = ActionFn:InvokeServer(name)
+	if msg and msg ~= "" then
+		showToast(msg)
+	end
+	return ok
+end
+hatchBtn.Activated:Connect(function()
+	act("hatch")
+end)
+fuseBtn.Activated:Connect(function()
+	act("fuse")
+end)
+dailyBtn.Activated:Connect(function()
+	act("daily")
+end)
+homeBtn.Activated:Connect(function()
+	act("home")
+end)
+
+-- Shop shortcut (only shows once real pass ids are set in Config)
+if Config.GamePasses.DoubleEnergy ~= 0 then
+	local shop = button("2x", Color3.fromRGB(253, 186, 116), 70)
+	shop.Activated:Connect(function()
+		MarketplaceService:PromptGamePassPurchase(player, Config.GamePasses.DoubleEnergy)
+	end)
+end
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+</roblox>
